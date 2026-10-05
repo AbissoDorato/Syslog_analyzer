@@ -40,7 +40,13 @@ Trascina nella pagina un file `.txt`, `.log` o `.csv` (massimo 30 MB). Per i fil
 
 Per i CSV, l'applicazione cerca una colonna per il messaggio (`message`, `msg`, `event`, `log`, `content`, `description` o `testo`) e colonne comuni per timestamp, host, processo, PID e severità. Se le intestazioni sono diverse, i campi possono comunque comparire nel messaggio aggregato.
 
+Sono supportate anche le colonne `TimeGenerated`, `Computer`, `Facility`, `SecurityLevel`, `SyslogMessage`, `Processname` e `HostIP` (anche con intestazione UTF-8 BOM). Questi campi alimentano i timestamp, host, facility, livello, messaggio, processo e indirizzo IP rispettivamente.
+
 La dashboard mostra i conteggi per processo, la severità, gli host più attivi e i messaggi ricorrenti. Numeri e identificativi nel testo vengono normalizzati durante l'aggregazione, così eventi simili vengono raggruppati. Selezionando un processo puoi vedere i suoi messaggi più frequenti.
+
+La sezione delle correlazioni riassume le associazioni osservate tra processo e facility, livello di sicurezza e IP, oltre ai processi presenti nella stessa finestra temporale. Quote e conteggi descrivono il dataset caricato: le co-occorrenze temporali non dimostrano un rapporto causale.
+
+L'albero temporale cerca nei messaggi indicatori di avvio in italiano e inglese (per esempio `started`, `launched`, `created` e `avviato`). Per ogni avvio mostra fino a 20 eventi successivi dello stesso processo entro 30 minuti e fino a 10 eventi di altri processi sullo stesso host, vicini entro la finestra temporale configurata. Vengono mostrati al massimo i 100 avvii più recenti. È un'indicazione euristica: la vicinanza temporale e sullo stesso host non dimostra da sola una relazione causale.
 
 Gli spike sono calcolati per finestre temporali configurabili. Una finestra viene segnalata se contiene almeno 3 eventi e supera la media delle finestre di quel processo per il moltiplicatore impostato. Il confronto include gli intervalli senza eventi quando l'intervallo complessivo è entro 20.000 finestre. I log senza timestamp restano analizzabili per conteggi e processi, ma non contribuiscono al grafico temporale o ai picchi.
 
