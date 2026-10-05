@@ -28,10 +28,30 @@ In alternativa: `python3 app.py`, oppure `chmod +x avvia.sh` e `./avvia.sh`.
 
 La pagina è disponibile su `http://127.0.0.1:8765`. L'opzione `--port 9000` cambia porta; `--no-browser` evita l'apertura automatica. Entrambi gli script inoltrano queste opzioni. `Ctrl+C` termina il servizio. L'apertura del browser può non essere disponibile in sessioni Linux senza desktop.
 
+### File grandi
+
+Il limite predefinito è **200 MB** per file e per contenuto decodificato in UTF-8. Puoi aumentarlo con `--max-file-mb`. Il limite dei record è indipendente: `--max-events` imposta quanti record esaminare, con valore predefinito **250.000**. Entrambe le opzioni accettano interi positivi; nell'app 1 MB corrisponde a 1.048.576 byte.
+
+Per esempio, per accettare file fino a **500 MB** ed esaminare fino a **1.000.000 di record**:
+
+```powershell
+py -3 app.py --max-file-mb 500 --max-events 1000000
+```
+
+Su Linux:
+
+```sh
+sh avvia.sh --max-file-mb 500 --max-events 1000000
+```
+
+Anche `Avvia Syslog Analyser.bat` inoltra queste opzioni. Dopo aver cambiato i limiti, riavvia il server e ricarica la pagina: l'area di caricamento mostra i valori configurati dal server. Se viene raggiunto il limite dei record, la diagnostica segnala **import parziale** e indica il limite applicato.
+
+Il file e gli eventi restano in memoria: file più grandi e più record richiedono più RAM e tempo, anche oltre la dimensione del file su disco. Il calcolo della dimensione UTF-8 e dell'hash lavora a blocchi per evitare ulteriori copie complete; l'analisi complessiva non è in streaming. Per export che non rientrano nella memoria disponibile, suddividi per host o intervallo temporale.
+
 ## Flusso di lavoro
 
-1. Carica CSV, TXT o LOG (massimo 30 MB). Sono letti UTF-8 e UTF-16 con BOM; il contenuto decodificato deve rientrare in 30 MB UTF-8.
-2. Controlla la **Diagnostica importazione**. Imposta separatore CSV, fuso per date che ne sono prive e ordine giorno/mese delle date con slash.
+1. Carica CSV, TXT o LOG (massimo **200 MB** predefiniti, configurabile). Sono letti UTF-8 e UTF-16 con BOM; sia il file sia il contenuto decodificato in UTF-8 devono rientrare nel limite.
+2. Controlla la **Diagnostica importazione**. Imposta separatore CSV, fuso per date senza offset e senza `[UTC]` nell'intestazione, e ordine giorno/mese delle date con slash. Tutta l'analisi viene presentata in UTC.
 3. Scegli se **considerare lo storico della macchina**, quindi premi **Ricalcola** per applicare le impostazioni.
 4. Seleziona host e finestra nel **Dossier per il ticket**. Leggi conteggi, categorie, processi, suggerimenti ed evidenze.
 5. Scegli una causa dal catalogo oppure lascia **Causa da determinare**. Una causa scelta manualmente viene indicata come tale se le soglie della regola non sono soddisfatte.
@@ -50,7 +70,7 @@ Carica [`examples/demo.csv`](examples/demo.csv), che contiene dati sintetici. Co
 
 Il pannello è visibile anche quando l'import fallisce. Le segnalazioni riguardano **la lettura del file**: un evento con `SecurityLevel=error` non è di per sé un errore di importazione.
 
-Il riepilogo distingue record esaminati, analizzati, esclusi e utilizzabili nelle finestre temporali. Mostra formato, codifica, separatore e colonne riconosciute. Puoi filtrare errori, avvisi e informazioni e scaricare la diagnosi in JSON.
+Il riepilogo distingue record esaminati, analizzati, esclusi e utilizzabili nelle finestre temporali. Mostra formato, codifica, separatore, colonne riconosciute e numero di timestamp validi per colonna di provenienza. Puoi filtrare errori, avvisi e informazioni e scaricare la diagnosi in JSON.
 
 Ogni problema indica effetto sull'analisi, correzione consigliata e fino a **5 esempi**, con numero di record, righe fisiche iniziale/finale, colonna e valore originale (massimo 240 caratteri). I conteggi includono tutte le occorrenze esaminate; più problemi possono interessare lo stesso record.
 
@@ -58,31 +78,61 @@ Ogni problema indica effetto sull'analisi, correzione consigliata e fino a **5 e
 |---|---|
 | Record con troppe/poche colonne | Il record è escluso; gli altri vengono analizzati. L'import è indicato come parziale. |
 | Timestamp non valido o mancante | Il record resta nei conteggi generali, ma non nelle finestre temporali. |
+| EventTime non valido con TimeGenerated valorizzato | Segnalazione separata; il riferimento temporale TimeGenerated resta invariato. |
+| Offset non UTC in una colonna `[UTC]` | Avviso; viene rispettato l'offset nel valore e l'istante è convertito in UTC. |
 | HostIP non valido | È conservato per la diagnosi, ma non usato per dedurre direzione o identità dell'host. |
 | Date ambigue, fuso/anno assunti, campi mancanti o personalizzati | Segnalazione con interpretazione applicata e istruzioni per correggere l'export. |
 | Intestazioni duplicate/vuote o nessuna colonna riconosciuta | Import bloccato per evitare interpretazioni silenziosamente errate. |
 | Apici CSV non chiusi o sintassi non recuperabile | Import bloccato; anche il prefisso letto prima dell'errore non viene analizzato. |
-| Codifica non valida, caratteri NUL o file oltre limite | Import bloccato con indicazioni per riesportare il file. |
+| Codifica non valida o caratteri NUL | Import bloccato con indicazioni per riesportare il file. |
+| File oltre il limite configurato | Import bloccato con indicazione del limite; aumenta `--max-file-mb` o suddividi il file. |
 
 Il **separatore CSV** può essere automatico o impostato manualmente (virgola, punto e virgola, tab, pipe). I messaggi contenenti il separatore devono essere quotati secondo il formato CSV. Gli errori interni del server vengono segnalati separatamente e non sono attribuiti automaticamente ai dati.
 
 ## Colonne CSV
 
+È riconosciuta l'intestazione completa, nell'ordine indicato:
+
+```csv
+TenantId,SourceSystem,TimeGenerated[UTC],MG,Computer,EventTime[UTC],Facility,Hostname,Seceritylevel,SyslogMessage,ProcessID,HostIP,ProcessName,CollectorHostName,Type
+```
+
+Il parser associa i campi per nome: l'ordine può cambiare. `Seceritylevel` è supportato anche con questa grafia.
+
 | Colonna | Uso |
 |---|---|
-| `TimeGenerated` | Timestamp di riferimento per finestre, sequenze e albero |
-| `Computer` | Identità dell'host per separare i contesti |
+| `TenantId` | Metadato del tenant conservato nelle evidenze JSON |
+| `SourceSystem` | Metadato del sistema sorgente conservato nelle evidenze JSON |
+| `TimeGenerated[UTC]` / `TimeGenerated` | Timestamp prioritario per finestre, sequenze e albero |
+| `MG` | Metadato del gruppo di gestione conservato nelle evidenze JSON |
+| `Computer` | Identità dell'host per separare i contesti; precede `Hostname` |
+| `EventTime[UTC]` / `EventTime` | Data dell'evento conservata anche in UTC; riferimento alternativo se TimeGenerated è assente o vuoto |
 | `Facility` | Sottosistema syslog, distribuzioni e contesto del ticket |
-| `SecurityLevel` | Livello syslog normalizzato: numeri 0–7 e alias come `err`, `warn`, `informational` |
+| `Hostname` | Nome conservato nelle evidenze e usato come host se Computer è vuoto o assente |
+| `Seceritylevel` / `SecurityLevel` | Livello syslog normalizzato: numeri 0–7 e alias come `err`, `warn`, `informational` |
 | `SyslogMessage` | Testo per classificazione, evidenze e campi di rete espliciti |
-| `Processname` | Processo che **registra** l'evento; può differire dal servizio avviato |
+| `ProcessID` / `PID` | Identificativo del processo, usato anche nelle correlazioni temporali |
 | `HostIP` | Indirizzo dell'host del record, non una destinazione remota |
+| `ProcessName` | Processo che **registra** l'evento; può differire dal servizio avviato |
+| `CollectorHostName` | Nome del collettore conservato nelle evidenze; non sostituisce Computer |
+| `Type` | Metadato del tipo di record conservato nelle evidenze JSON |
 
 Intestazioni senza distinzione maiuscole/minuscole, spazi, trattini o underscore. Sono conservati gli alias comuni delle versioni precedenti, compresi `message`, `timestamp`, `process_name`, `host` e `severity`. Il delimitatore viene scelto tra virgola, punto e virgola, tab e pipe in base alle intestazioni riconosciute. Sono supportati campi quotati, messaggi multilinea e BOM.
 
-I campi espliciti del CSV hanno precedenza sul messaggio. Un `TimeGenerated` presente ma non valido viene segnalato, senza sostituirlo silenziosamente con un'altra data. Gli eventi non databili restano nei conteggi generali, ma sono esclusi da spike e sequenze.
+I campi espliciti del CSV hanno precedenza sul messaggio. `TimeGenerated` ha priorità; se assente o vuoto si usa `EventTime`, con segnalazione informativa. Se entrambi sono vuoti si prova il timestamp nel messaggio syslog. Un timestamp prioritario valorizzato ma non valido viene segnalato, senza sostituirlo con un'altra data. Gli eventi non databili restano nei conteggi generali, ma sono esclusi da spike e sequenze.
 
-Per TXT/LOG sono riconosciuti syslog RFC 3164, RFC 5424 e prefissi ISO con host e tag del processo. PID e facility vengono estratti quando disponibili. Le date vengono normalizzate in **UTC**: i timestamp senza fuso usano l'offset scelto (predefinito `+00:00`); quelli RFC 3164 senza anno usano l'anno corrente UTC con avviso. Per log che attraversano cambi d'ora legale, preferisci un export con offset esplicito.
+`Computer` e `Hostname` possono coesistere senza avviso di ambiguità. I metadati aggiuntivi sono facoltativi e non causano avvisi di colonna mancante nei precedenti export a sette colonne. I valori originali e i nomi delle colonne selezionate sono conservati nelle evidenze JSON.
+
+### Timestamp e UTC
+
+- **Colonne `[UTC]`:** un valore senza fuso è già UTC, indipendentemente dal fuso configurato o da quello del computer/browser. È indicato nella diagnostica come UTC dichiarato nell'intestazione.
+- **Offset esplicito nel valore:** viene rispettato e convertito in UTC. Per esempio `2026-10-05T12:00:00+02:00` diventa `2026-10-05T10:00:00Z`. Se la colonna dichiara `[UTC]`, l'incoerenza viene segnalata.
+- **Nessuna indicazione di fuso:** solo per colonne senza `[UTC]` e per syslog senza offset viene applicato il fuso scelto, predefinito `+00:00`.
+- Grafici, finestre dello storico, albero, evidenze e ticket usano UTC. L'export include sia `time_generated` sia `event_time` normalizzati e la colonna effettivamente usata in `timestamp_source`.
+
+Esempio: `2026-10-05 12:00:00` in `TimeGenerated[UTC]` rimane alle **12:00 UTC**, anche impostando `+02:00`. Lo stesso valore in `TimeGenerated` senza indicazione UTC diventa **10:00 UTC** con quell'impostazione. Il fuso non risolve l'ambiguità giorno/mese: per le date con slash resta necessario scegliere DMY o MDY.
+
+Per TXT/LOG sono riconosciuti syslog RFC 3164, RFC 5424 e prefissi ISO con host e tag del processo. PID e facility vengono estratti quando disponibili. Le date RFC 3164 senza anno usano l'anno corrente UTC con avviso. Per log che attraversano cambi d'ora legale, preferisci un export con offset esplicito.
 
 ## Rilevamento dei picchi
 
@@ -147,7 +197,7 @@ Queste sono **associazioni candidate da validare**, non rilevazioni MITRE certif
 
 Il ticket include host/IP, finestra UTC, baseline, categorie, processi, ipotesi, controlli, record originali campionati, qualità del parsing e versione del catalogo. Il SHA-256 identifica **il testo UTF-8 analizzato**, non necessariamente i byte originali di un export UTF-16. Il dossier JSON aggiunge i parametri e la causa selezionata.
 
-- Analisi dei primi **250.000 eventi**; eventuale troncamento segnalato.
+- Analisi dei primi **250.000 record** per impostazione predefinita, modificabile con `--max-events`; eventuale troncamento segnalato.
 - Massimo **50 dossier** ordinati per presenza di anomalia ed eccesso di eventi. Il conteggio totale delle finestre rimane visibile.
 - Massimo **30 evidenze** per dossier, con campioni delle regole attivate; testo fino a 2.000 caratteri per campo con indicazione del troncamento.
 - Grafico generale con al massimo 600 barre aggregate, mantenendo il totale degli eventi.

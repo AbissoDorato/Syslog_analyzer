@@ -6,6 +6,7 @@
   <meta name="referrer" content="no-referrer">
   <title>Syslog Analyser · dall'evento al ticket</title>
   <link rel="stylesheet" href="/styles.css">
+  <script src="/config.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -14,16 +15,17 @@
   <section class="intro"><h2>Ricostruisci il picco. Documenta le evidenze.</h2><p>Analizza syslog e CSV, confronta le possibili cause e prepara un ticket verificabile.</p></section>
   <p class="notice">Il volume dei log misura eventi. Per confermare un aumento del traffico del PC, confronta queste finestre con byte, pacchetti e direzione rilevati dalla telemetria di rete.</p>
   <section class="ingest">
-    <div class="drop" id="drop"><div class="uploadicon">↥</div><div><strong>Trascina qui il file</strong><p>CSV, TXT o LOG · massimo 30 MB</p></div><div class="spacer"></div><button class="btn primary" id="choose">Scegli file</button><input id="file" type="file" accept=".csv,.txt,.log" hidden></div>
+    <div class="drop" id="drop"><div class="uploadicon">↥</div><div><strong>Trascina qui il file</strong><p id="uploadLimits">CSV, TXT o LOG</p></div><div class="spacer"></div><button class="btn primary" id="choose">Scegli file</button><input id="file" type="file" accept=".csv,.txt,.log" hidden></div>
     <div class="settings">
       <label class="setting">Finestra <input id="window" type="number" value="5" min="1" max="1440"> min</label>
       <label class="setting">Moltiplicatore <input id="threshold" type="number" value="2" min="1.1" max="100" step="0.1"> ×</label>
       <label class="setting">Min. eventi <input id="minEvents" type="number" value="5" min="3" max="100000"></label>
       <label class="setting history-choice"><input id="useHistory" type="checkbox" checked> Considera lo storico della macchina</label>
-      <label class="setting">Fuso se assente <input id="offset" type="text" value="+00:00" aria-label="Fuso per timestamp privi di timezone"></label>
+      <label class="setting">Fuso per date senza indicazione <input id="offset" type="text" value="+00:00" aria-label="Fuso per date senza offset e senza UTC nell'intestazione"></label>
       <label class="setting">Date con slash <select id="dateOrder"><option value="DMY">giorno/mese/anno</option><option value="MDY">mese/giorno/anno</option></select></label>
       <label class="setting">Separatore CSV <select id="delimiter"><option value="auto">Automatico</option><option value=",">Virgola (,)</option><option value=";">Punto e virgola (;)</option><option value="tab">Tabulazione</option><option value="|">Pipe (|)</option></select></label>
       <button class="btn" id="reanalyze" disabled>Ricalcola</button>
+      <div class="hint">Orari, grafici e ticket in UTC. Le colonne TimeGenerated[UTC] ed EventTime[UTC] dichiarano UTC; il fuso qui sopra si applica solo quando manca ogni indicazione. Se TimeGenerated è assente o vuoto, si usa EventTime.</div>
       <div class="hint" id="methodHint">Storico: fino a 12 finestre precedenti dello stesso host nel file caricato, almeno 3. Premi Ricalcola dopo aver modificato le impostazioni.</div>
     </div>
   </section>
@@ -34,6 +36,7 @@
     <p class="hint">Queste segnalazioni riguardano il file e la sua lettura. I livelli SecurityLevel dei syslog sono analizzati separatamente.</p>
     <div id="qualitySummary" class="metrics"></div>
     <p id="importFormat" class="hint"></p>
+    <p id="importTime" class="hint"></p>
     <div class="toolbar"><label>Mostra <select id="diagnosticFilter"><option value="">Tutte le segnalazioni</option><option value="error">Errori di importazione</option><option value="warning">Avvisi</option><option value="info">Assunzioni / informazioni</option></select></label><button id="downloadImport" class="btn">Scarica diagnosi .json</button></div>
     <div id="qualityBody"></div>
     <details><summary>Intestazioni e colonne riconosciute</summary><div class="tablewrap" id="columnMapping"></div></details>

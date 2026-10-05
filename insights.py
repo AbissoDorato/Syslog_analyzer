@@ -81,11 +81,17 @@ def lifecycle(event):
 
 def evidence(event):
     return {"row": event["row"], "line": event["line"], "time": event["timestamp"],
+            "timestamp_source": event.get("timestamp_source"),
+            "timestamp_original": event.get("timestamp_original", "")[:2000],
+            "time_generated": event.get("time_generated"), "event_time": event.get("event_time"),
             "host": event["host"], "host_ip": event["host_ip"], "process": event["process"],
             "pid": event["pid"], "facility": event["facility"], "severity": event["severity"],
             "category": event["category"], "message": event["message"][:2000],
-            "raw": event["raw"][:2000], "text_truncated": len(event["raw"]) > 2000 or len(event["message"]) > 2000,
+            "raw": event["raw"][:2000], "text_truncated": len(event["raw"]) > 2000 or len(event["message"]) > 2000
+            or any(len(value) > 2000 for value in event.get("columns", {}).values()),
             "columns": {key: value[:2000] for key, value in event.get("columns", {}).items()},
+            "column_sources": event.get("column_sources", {}),
+            "metadata": {key: value[:2000] for key, value in event.get("metadata", {}).items()},
             "network": event["network"]}
 
 
@@ -213,15 +219,20 @@ def markdown_ticket(incident, filename, file_hash, quality):
     lines += ["", "## Evidenze (campione)", "I numeri di record sono riferimenti all'input; il testo qui sotto proviene dai log."]
     for item in incident["evidence"]:
         lines += [f"- Record {item['row']}, riga finale {item['line']}, {item['time']}, "
+                  f"riferimento {item['timestamp_source'] or 'syslog'}, "
                   f"{item['process']} [{item['severity']}], facility {item['facility']}:",
                   "> " + item["raw"].replace("\r", "").replace("\n", "\n> ")]
+        if item["event_time"]:
+            lines.append(f"  EventTime UTC: {item['event_time']}.")
     lines += ["", "## Limiti e verifiche richieste",
               "- I conteggi misurano eventi di log, non byte/pacchetti, banda o probabilità di compromissione.",
               "- HostIP identifica l'host del record; SRC/DST vengono estratti solo quando espliciti nel messaggio.",
               "- Confermare il picco con contatori di interfaccia, firewall, proxy o NetFlow e verificare la direzione.",
               ("- Le finestre senza eventi sono trattate come zero: verificare continuità della raccolta e cambi del livello di logging."
                if incident["use_history"] else "- Confronto storico disattivato: quote e ipotesi riguardano solo la finestra selezionata."),
-              f"- Timestamp senza fuso interpretati come {quality['naive_offset']}; date con slash: {quality['date_order']}.",
+              f"- Riferimento temporale: {quality['timestamp_policy']}",
+              "- Tutti gli orari dell'analisi sono in UTC. Valori senza fuso nelle colonne [UTC]: UTC; "
+              f"negli altri campi: {quality['naive_offset']}. Date con slash: {quality['date_order']}.",
               f"- Qualità input: {json.dumps(quality['counts'], ensure_ascii=False)}; limite eventi raggiunto: {quality['truncated']}.",
               f"- Import: {quality['summary']['analyzed_records']} record analizzati su {quality['summary']['records_read']} esaminati; "
               f"{quality['summary']['skipped_records']} esclusi per struttura CSV non valida.",

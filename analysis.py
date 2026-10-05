@@ -10,7 +10,7 @@ from statistics import median
 
 from insights import (CATALOG, CATEGORIES, EVIDENCE_LIMIT, auth_sequences, classify, distribution,
                       evidence, extract_network, hypotheses, lifecycle, markdown_ticket, message_template)
-from parsing import UNKNOWN, read_events
+from parsing import MAX_EVENTS, MAX_FILE, UNKNOWN, read_events, utf8_chunks
 
 LOOKBACK = 12
 MIN_BASELINE = 3
@@ -187,7 +187,8 @@ def build_incident(host, bucket, events, stats, contributors, buckets, seconds, 
 
 
 def analyze(content: str, filename: str, window_minutes=5, threshold=2.0,
-            min_events=5, naive_offset="+00:00", date_order="DMY", use_history=True, delimiter="auto") -> dict:
+            min_events=5, naive_offset="+00:00", date_order="DMY", use_history=True, delimiter="auto",
+            max_file_bytes=MAX_FILE, max_events=MAX_EVENTS) -> dict:
     if not isinstance(content, str) or not isinstance(filename, str):
         raise ValueError("Contenuto e nome del file devono essere testo.")
     if not 1 <= window_minutes <= 1440 or int(window_minutes) != window_minutes:
@@ -199,8 +200,12 @@ def analyze(content: str, filename: str, window_minutes=5, threshold=2.0,
     if not 3 <= min_events <= 100_000 or int(min_events) != min_events:
         raise ValueError("Il minimo deve essere un intero tra 3 e 100000 eventi.")
     seconds = int(window_minutes) * 60
-    rows, quality = read_events(content, filename, naive_offset, date_order, delimiter=delimiter)
-    file_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    rows, quality = read_events(content, filename, naive_offset, date_order,
+                                limit=max_events, delimiter=delimiter, max_file_bytes=max_file_bytes)
+    digest = hashlib.sha256()
+    for chunk in utf8_chunks(content):
+        digest.update(chunk)
+    file_hash = digest.hexdigest()
     enrichment_cache = {}
     for event in rows:
         signature = (event["process"], event["message"], event["host_ip"])
@@ -277,7 +282,9 @@ def analyze(content: str, filename: str, window_minutes=5, threshold=2.0,
             "source": {"filename": filename, "sha256": file_hash}, "catalog_version": CATALOG["version"],
             "parameters": {"window_minutes": window_minutes, "threshold": threshold if use_history else None, "min_events": min_events,
                            "lookback": LOOKBACK if use_history else 0, "minimum_baseline_windows": MIN_BASELINE if use_history else 0,
-                           "use_history": use_history, "delimiter": delimiter},
+                           "use_history": use_history, "delimiter": delimiter, "timezone": "UTC",
+                           "naive_offset": naive_offset, "date_order": date_order,
+                           "max_file_bytes": max_file_bytes, "max_events": max_events},
             "flagged_window_count": flagged_count, "analysis_warnings": analysis_warnings,
             "spike_count": spike_count, "incident_count": len(candidates), "incidents": incidents,
             "processes": [{"name": p, "count": count, "percent": round(100 * count / total, 2) if total else 0,

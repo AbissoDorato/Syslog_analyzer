@@ -5,6 +5,8 @@ const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({
   "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
 })[c]);
 const time = value => (value || "senza timestamp").replace("T", " ").replace("Z", " UTC");
+// Loaded from the local server so browser and parser use the same configured limits.
+const importLimits = globalThis.SYSLOG_CONFIG || {};
 let data = null, lastFile = null, active = null, requestId = 0, controller = null;
 let importReport = null, importSource = null;
 const drafts = new Map();
@@ -56,10 +58,18 @@ function renderImportReport(report) {
   $("#importFormat").textContent = "Formato: " + report.format.type + " · separatore: " + sep +
     " · codifica: " + (importSource?.encoding || "testo UTF-8 analizzato") + " · record con segnalazioni: " +
     number(s.records_with_issues) + ". Più segnalazioni possono riguardare lo stesso record." +
+    (report.max_file_bytes ? " Contenuto UTF-8: " + fmt((report.content_bytes || 0)/(1024*1024)) +
+      " MB / " + fmt(report.max_file_bytes/(1024*1024)) + " MB; limite record: " + fmt(report.event_limit) + "." : "") +
     (s.parsed_before_block ? " Prima del blocco erano stati letti " + s.parsed_before_block + " record: non sono stati analizzati." : "");
+  const sources = Object.entries(report.timestamp_sources || {}).map(([column,count])=>column+": "+fmt(count)+" record");
+  $("#importTime").textContent = report.timestamp_policy ? "Orari dell'analisi: UTC. " + report.timestamp_policy +
+    " Fuso per valori senza indicazione: " + report.naive_offset + "." +
+    (sources.length ? " Riferimenti temporali validi: " + sources.join("; ") + "." : "") : "";
   const mapping = Object.entries(report.mapping || {});
   $("#columnMapping").innerHTML = "<p>Intestazioni: " + esc((report.columns || []).join(" | ") || "nessuna intestazione CSV") + "</p>" +
-    table(["Campo","Colonna / alias prioritario"],mapping.map(([field,column])=>[esc(field),esc(column || "assente")]));
+    "<p>Le colonne nella stessa riga sono in ordine di priorità; si usa il primo valore non vuoto. Computer precede Hostname; CollectorHostName resta un dato del collettore.</p>" +
+    table(["Campo","Colonne in ordine di priorità"],mapping.map(([field,column])=>[
+      esc(report.field_names?.[field] || field),esc(report.mapping_candidates?.[field]?.join(" → ") || column || "assente")]));
   renderDiagnosticIssues();
 }
 
@@ -104,8 +114,10 @@ async function loadFile(file) {
   data = null;
   drafts.clear();
   choices.clear();
-  if (file.size > 30 * 1024 * 1024) {
-    clientImportFailure("file_size","Il file supera 30 MB","Nessun record è stato letto.","Suddividi l'export in file più piccoli."); return;
+  if (importLimits.max_file_bytes && file.size > importLimits.max_file_bytes) {
+    clientImportFailure("file_size","Il file supera " + fmt(importLimits.max_file_bytes/(1024*1024)) + " MB",
+      "Dimensione del file: " + fmt(file.size/(1024*1024)) + " MB. Nessun record è stato letto.",
+      "Aumenta --max-file-mb all'avvio e ricarica la pagina, oppure suddividi l'export."); return;
   }
   if (!/\.(csv|txt|log)$/i.test(file.name)) {
     clientImportFailure("file_type","Formato non supportato","Nessun record è stato letto.","Esporta un CSV, TXT o LOG; un file XLSX non è un CSV."); return;
@@ -261,7 +273,9 @@ function updateCause() {
 
 function evidenceTable(events) {
   return table(["Record / UTC","Processo · facility · livello","Messaggio originale"], events.map(e => [
-    "#" + fmt(e.row) + " (riga " + fmt(e.line) + ")<br>" + esc(time(e.time)),
+    "#" + fmt(e.row) + " (riga " + fmt(e.line) + ")<br>" + esc(time(e.time)) +
+      (e.timestamp_source ? '<br><span class="hint">Riferimento: '+esc(e.timestamp_source)+"</span>" : "") +
+      (e.event_time ? '<br><span class="hint">EventTime: '+esc(time(e.event_time))+"</span>" : ""),
     esc(e.process) + (e.pid ? " [" + esc(e.pid) + "]" : "") + "<br>" + esc(e.facility) + " · " + esc(e.severity),
     '<div class="event-text">' + esc(e.raw) + (e.text_truncated ? " … [testo troncato]" : "") + "</div>"
   ]));
@@ -378,3 +392,7 @@ $("#downloadEvidence").addEventListener("click",()=>{
     "dossier-"+active.id+".json","application/json;charset=utf-8");
 });
 updateHistoryControls();
+if (importLimits.max_file_bytes) {
+  $("#uploadLimits").textContent = "CSV, TXT o LOG · massimo " + fmt(importLimits.max_file_bytes/(1024*1024)) +
+    " MB · fino a " + fmt(importLimits.max_events) + " record";
+}

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from import_diagnostics import Diagnostics, FIELD_NAMES, ImportFailure
 
 MAX_EVENTS = 250_000
-MAX_FILE = 30 * 1024 * 1024
+MAX_FILE = 200 * 1024 * 1024
 UNKNOWN = "unknown"
 SEVERITIES = ("emergency", "alert", "critical", "error", "warning", "notice", "info", "debug")
 FACILITIES = ("kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news",
@@ -20,15 +20,24 @@ FACILITIES = ("kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news",
 MONTHS = {name: i for i, name in enumerate(
     ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
 ALIASES = {
-    "timestamp": ("timegenerated", "timestamp", "time", "datetime", "date", "@timestamp", "data", "ora"),
+    "timestamp": ("timegenerated[utc]", "timegenerated", "timestamp", "time", "datetime", "date", "@timestamp", "data", "ora"),
+    "event_time": ("eventtime[utc]", "eventtime"),
     "host": ("computer", "hostname", "host", "machine"),
     "facility": ("facility", "syslogfacility"),
-    "severity": ("securitylevel", "severity", "level", "priority", "loglevel"),
+    "severity": ("securitylevel", "seceritylevel", "severity", "level", "priority", "loglevel"),
     "message": ("syslogmessage", "message", "msg", "event", "log", "content", "description", "testo"),
     "process": ("processname", "process", "program", "application", "app", "comm", "unit", "service"),
     "pid": ("pid", "processid"),
     "host_ip": ("hostip", "ip", "ipaddress"),
+    "tenant_id": ("tenantid",),
+    "source_system": ("sourcesystem",),
+    "management_group": ("mg", "managementgroup"),
+    "hostname": ("hostname",),
+    "collector_host_name": ("collectorhostname",),
+    "type": ("type",),
 }
+EXPECTED_FIELDS = ("timestamp", "host", "facility", "severity", "message", "process", "host_ip")
+METADATA_FIELDS = ("tenant_id", "source_system", "management_group", "hostname", "collector_host_name", "type")
 TAG = re.compile(r"^(?P<proc>[^\s\[\]:]+)(?:\[(?P<pid>\d+)\])?$")
 RFC3164 = re.compile(
     r"^(?:<(?P<pri>\d{1,3})>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})"
@@ -59,20 +68,25 @@ def offset_timezone(offset):
     return timezone(timedelta(minutes=(hours * 60 + minutes) * (-1 if offset[0] == "-" else 1)))
 
 
-def parse_timestamp(value, offset="+00:00", date_order="DMY"):
+def parse_timestamp(value, offset="+00:00", date_order="DMY", *, declared_utc=False):
     """Return canonical time and quality flags; never guess ambiguous day/month order."""
     value = value_or_empty(value)
     flags = []
     if not value:
         return None, ["missing_timestamp"]
     try:
-        text = value.replace(" UTC", "+00:00").replace("Z", "+00:00")
+        text = re.sub(r"\s*(?:UTC|Z)$", "+00:00", value, flags=re.I)
         # Python 3.10 accepts six fractional digits reliably.
         text = re.sub(r"(\.\d{6})\d+", r"\1", text)
         try:
             dt = datetime.fromisoformat(text)
         except ValueError:
-            match = re.fullmatch(r"([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d\d:\d\d:\d\d)", value)
+            zone = re.search(r"([+-])(\d{2}):?(\d{2})$", text)
+            suffix_timezone = offset_timezone(f"{zone[1]}{zone[2]}:{zone[3]}") if zone else None
+            local_text = text[:zone.start()].rstrip() if zone else text
+            # Some table exports separate the date and clock with a comma inside a quoted cell.
+            local_text = re.sub(r"^(\d{1,2}/\d{1,2}/\d{4}),\s*", r"\1 ", local_text)
+            match = re.fullmatch(r"([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d\d:\d\d:\d\d)", local_text)
             if match and match[1] in MONTHS:
                 dt = datetime(datetime.now(timezone.utc).year, MONTHS[match[1]], int(match[2]),
                               *map(int, match[3].split(":")))
@@ -80,20 +94,25 @@ def parse_timestamp(value, offset="+00:00", date_order="DMY"):
             else:
                 fmt = "%d/%m/%Y" if date_order == "DMY" else "%m/%d/%Y"
                 dt = None
-                for suffix in (" %H:%M:%S.%f", " %H:%M:%S", " %H:%M", " %I:%M:%S %p"):
+                for suffix in (" %H:%M:%S.%f", " %H:%M:%S", " %H:%M", " %I:%M:%S.%f %p", " %I:%M:%S %p", " %I:%M %p"):
                     try:
-                        dt = datetime.strptime(value, fmt + suffix)
+                        dt = datetime.strptime(local_text, fmt + suffix)
                         break
                     except ValueError:
                         continue
                 if dt is None:
                     raise ValueError("invalid date")
-                parts = value.split(" ", 1)[0].split("/")
+                parts = local_text.split(" ", 1)[0].split("/")
                 if len(parts) == 3 and 1 <= int(parts[0]) <= 12 and 1 <= int(parts[1]) <= 12 and int(parts[0]) != int(parts[1]):
                     flags.append("ambiguous_date")
+            if suffix_timezone is not None:
+                dt = dt.replace(tzinfo=suffix_timezone)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=offset_timezone(offset))
-            flags.append("assumed_timezone")
+            dt = dt.replace(tzinfo=timezone.utc if declared_utc else offset_timezone(offset))
+            flags.append("column_utc" if declared_utc else "assumed_timezone")
+        elif declared_utc and dt.utcoffset() != timedelta(0):
+            # An explicit offset identifies an instant; do not silently relabel it as UTC.
+            flags.append("timezone_conflict")
         return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"), flags
     except (ValueError, OverflowError):
         return None, ["invalid_timestamp"]
@@ -172,6 +191,8 @@ def parse_line(line, offset="+00:00", date_order="DMY"):
                 event["message"] = tag_match[2]
     if match:
         event["input_timestamp"] = fields["ts"]
+        event["timestamp_source"] = "syslog"
+        event["timestamp_original"] = fields["ts"]
         event["timestamp"], event["flags"] = parse_timestamp(fields["ts"], offset, date_order)
         if fields.get("pri") and 0 <= int(fields["pri"]) <= 191:
             pri = int(fields["pri"])
@@ -180,13 +201,38 @@ def parse_line(line, offset="+00:00", date_order="DMY"):
 
 
 def normalize_row(row, offset="+00:00", date_order="DMY"):
+    names = {header(k): k for k in row if k is not None}
     originals = {header(k): str(v if v is not None else "") for k, v in row.items() if k is not None}
     clean = {header(k): value_or_empty(v) for k, v in row.items() if k is not None}
-    fields = {field: next((clean[key] for key in keys if clean.get(key)), "")
-              for field, keys in ALIASES.items()}
+    selected = {field: next((key for key in keys if clean.get(key)),
+                           next((key for key in keys if key in clean), None))
+                for field, keys in ALIASES.items()}
+    fields = {field: clean.get(key, "") for field, key in selected.items()}
     event = parse_line(fields["message"], offset, date_order)
-    if fields["timestamp"]:
-        event["timestamp"], event["flags"] = parse_timestamp(fields["timestamp"], offset, date_order)
+    if event.get("timestamp_source"):
+        event["timestamp_source"] = names.get(selected["message"], "SyslogMessage")
+    time_values, time_flags = {}, {}
+    for field in ("timestamp", "event_time"):
+        time_values[field], time_flags[field] = parse_timestamp(
+            fields[field], offset, date_order, declared_utc=bool(selected[field] and selected[field].endswith("[utc]")))
+    event["time_generated"] = time_values["timestamp"]
+    event["event_time"] = time_values["event_time"]
+    # Empty primary cells may use EventTime. An invalid, nonempty primary is never replaced.
+    time_field = "timestamp" if fields["timestamp"] else "event_time" if fields["event_time"] else None
+    event["field_diagnostics"] = []
+    if time_field:
+        event["timestamp"], event["flags"] = time_values[time_field], list(time_flags[time_field])
+        event["timestamp_source"] = names[selected[time_field]]
+        event["timestamp_original"] = originals[selected[time_field]]
+        if time_field == "event_time":
+            event["flags"].append("event_time_fallback")
+    elif not event.get("timestamp_source"):
+        event["timestamp_source"] = names.get(selected["timestamp"]) or names.get(selected["event_time"])
+    if fields["event_time"] and time_field != "event_time":
+        for flag in time_flags["event_time"]:
+            event["field_diagnostics"].append({
+                "code": "invalid_event_time" if flag == "invalid_timestamp" else flag,
+                "column": names[selected["event_time"]], "value": originals[selected["event_time"]]})
     for field in ("host", "host_ip", "pid"):
         if fields[field]:
             event[field] = fields[field]
@@ -201,10 +247,9 @@ def normalize_row(row, offset="+00:00", date_order="DMY"):
         event["flags"].append("unrecognized_severity")
     if event["facility"] not in (*FACILITIES, UNKNOWN):
         event["flags"].append("unrecognized_facility")
-    event["columns"] = {
-        field: next((originals[key] for key in keys if clean.get(key)),
-                    next((originals[key] for key in keys if key in originals), ""))
-        for field, keys in ALIASES.items()}
+    event["columns"] = {field: originals.get(key, "") for field, key in selected.items()}
+    event["column_sources"] = {field: names.get(key) for field, key in selected.items()}
+    event["metadata"] = {field: fields[field] for field in METADATA_FIELDS if fields[field]}
     if not fields["message"]:
         event["flags"].append("missing_message")
     if row.get(None):
@@ -218,7 +263,18 @@ def normalize_row(row, offset="+00:00", date_order="DMY"):
     return event
 
 
-def read_events(content, filename, offset="+00:00", date_order="DMY", limit=MAX_EVENTS, delimiter="auto"):
+def utf8_chunks(content):
+    """Encode in bounded chunks, avoiding a second full-size copy of large inputs."""
+    for start in range(0, len(content), 1024 * 1024):
+        yield content[start:start + 1024 * 1024].encode("utf-8")
+
+
+def read_events(content, filename, offset="+00:00", date_order="DMY", limit=MAX_EVENTS,
+                delimiter="auto", max_file_bytes=MAX_FILE):
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("Il limite di record deve essere un intero positivo.")
+    if isinstance(max_file_bytes, bool) or not isinstance(max_file_bytes, int) or max_file_bytes < 1:
+        raise ValueError("Il limite del file deve essere un numero intero positivo di byte.")
     offset_timezone(offset)
     if date_order not in ("DMY", "MDY"):
         raise ValueError("Ordine delle date non valido.")
@@ -226,28 +282,39 @@ def read_events(content, filename, offset="+00:00", date_order="DMY", limit=MAX_
         raise ValueError("Separatore non valido: scegli automatico, virgola, punto e virgola, tab o pipe.")
     diag = Diagnostics()
     rows, records_read, skipped = [], 0, 0
-    base = {"columns": [], "mapping": {}, "truncated": False, "event_limit": limit,
+    base = {"columns": [], "mapping": {}, "mapping_candidates": {}, "field_names": FIELD_NAMES,
+            "truncated": False, "event_limit": limit, "max_file_bytes": max_file_bytes,
             "naive_offset": offset, "date_order": date_order,
+            "timezone": "UTC", "timestamp_sources": {},
+            "timestamp_policy": "TimeGenerated ha precedenza; se assente o vuoto si usa EventTime. "
+                                "Se entrambi sono vuoti si usa il timestamp nel messaggio. "
+                                "Un valore non valido non viene sostituito. "
+                                "Le colonne [UTC] usano UTC; gli offset espliciti vengono convertiti in UTC.",
             "format": {"type": "csv" if filename.lower().endswith(".csv") else "syslog",
                        "delimiter": None, "delimiter_mode": delimiter}}
     def blocked(code, value="", **location):
         diag.add(code, value=value, **location)
         raise ImportFailure(diag.items[code]["title"],
                             diag.report(base, rows, records_read, skipped, blocked=True, complete=False))
-    if len(content.encode("utf-8")) > MAX_FILE:
-        blocked("file_too_large", f"{len(content.encode('utf-8'))} byte UTF-8")
+    content_bytes = sum(len(chunk) for chunk in utf8_chunks(content))
+    base["content_bytes"] = content_bytes
+    if content_bytes > max_file_bytes:
+        blocked("file_too_large", f"{content_bytes} byte UTF-8; limite configurato: {max_file_bytes} byte")
     if "\0" in content:
         blocked("null_bytes", "Caratteri NUL nel contenuto")
     if filename.lower().endswith(".csv"):
         text = content.lstrip("\ufeff")
-        first = next((line for line in io.StringIO(text) if line.strip()), "")
+        stream = io.StringIO(text, newline="")
+        first = next((line for line in stream if line.strip()), "")
+        stream.seek(0)
         known = {alias for aliases in ALIASES.values() for alias in aliases}
         if delimiter == "auto":
             delimiter = max(",;\t|", key=lambda sep: sum(header(x) in known for x in next(
                 csv.reader([first], delimiter=sep), [])))
         base["format"]["delimiter"] = delimiter
-        csv.field_size_limit(MAX_FILE)
-        reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True)
+        # csv uses a C long on Python 3.10/Windows: keep the per-cell limit portable.
+        csv.field_size_limit(min(max_file_bytes, 2**31 - 1))
+        reader = csv.reader(stream, delimiter=delimiter, strict=True)
         columns = []
         try:
             for values in reader:
@@ -267,14 +334,16 @@ def read_events(content, filename, offset="+00:00", date_order="DMY", limit=MAX_
             for field, aliases in ALIASES.items():
                 matches = [column for alias in aliases for column in columns if header(column) == alias]
                 base["mapping"][field] = matches[0] if matches else None
-                if len(matches) > 1:
+                base["mapping_candidates"][field] = matches
+                expected_host_fallback = field == "host" and {header(c) for c in matches} == {"computer", "hostname"}
+                if len(matches) > 1 and not expected_host_fallback:
                     diag.add("ambiguous_alias", column=FIELD_NAMES[field], value=" → ".join(matches),
                              line_start=1, line_end=reader.line_num)
-            if not any(base["mapping"].values()):
+            if not any(base["mapping"][field] for field in (*EXPECTED_FIELDS, "pid", "event_time")):
                 blocked("unrecognized_columns", " | ".join(column[:60] for column in columns[:8]),
                         line_start=1, line_end=reader.line_num)
-            for field, column in base["mapping"].items():
-                if column is None and field != "pid":
+            for field in EXPECTED_FIELDS:
+                if base["mapping"][field] is None and not (field == "timestamp" and base["mapping"]["event_time"]):
                     diag.add("missing_column", column=FIELD_NAMES[field], value="Colonna assente",
                              line_start=1, line_end=reader.line_num)
         while columns:
@@ -333,13 +402,21 @@ def read_events(content, filename, offset="+00:00", date_order="DMY", limit=MAX_
         for flag in row["flags"]:
             field = {"invalid_host_ip": "host_ip", "unrecognized_severity": "severity",
                      "unrecognized_facility": "facility"}.get(flag, flag.removeprefix("missing_"))
-            if flag in ("invalid_timestamp", "assumed_timezone", "ambiguous_date", "inferred_year"):
+            if flag in ("invalid_timestamp", "assumed_timezone", "ambiguous_date", "inferred_year",
+                        "column_utc", "timezone_conflict", "event_time_fallback"):
                 field = "timestamp"
-            diag.add(flag, event=row, column=base["mapping"].get(field))
+            if field == "timestamp":
+                diag.add(flag, event=row, column=row.get("timestamp_source") or base["mapping"].get(field),
+                         value=row.get("timestamp_original", row.get("input_timestamp", "")))
+            else:
+                diag.add(flag, event=row, column=row.get("column_sources", {}).get(field) or base["mapping"].get(field))
+        for detail in row.get("field_diagnostics", []):
+            diag.add(detail["code"], event=row, column=detail["column"], value=detail["value"])
         row["epoch"] = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")).timestamp() if row["timestamp"] else None
         # Missing identities are kept separate; do not correlate unrelated unknown hosts.
         row["host_key"] = row["host"] if row["host"] != UNKNOWN else (
             row["host_ip"] if clean_ip(row["host_ip"]) else f"unknown-row-{row['row']}")
+    base["timestamp_sources"] = dict(Counter(row.get("timestamp_source") or "syslog" for row in rows if row["timestamp"]))
     if not records_read:
         diag.add("no_records", value="File vuoto o senza record dopo l'intestazione")
     if not rows and skipped:
