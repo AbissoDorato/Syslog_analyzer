@@ -8,7 +8,7 @@ import ipaddress
 import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from itertools import islice
+from import_diagnostics import Diagnostics, FIELD_NAMES, ImportFailure
 
 MAX_EVENTS = 250_000
 MAX_FILE = 30 * 1024 * 1024
@@ -88,6 +88,9 @@ def parse_timestamp(value, offset="+00:00", date_order="DMY"):
                         continue
                 if dt is None:
                     raise ValueError("invalid date")
+                parts = value.split(" ", 1)[0].split("/")
+                if len(parts) == 3 and 1 <= int(parts[0]) <= 12 and 1 <= int(parts[1]) <= 12 and int(parts[0]) != int(parts[1]):
+                    flags.append("ambiguous_date")
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=offset_timezone(offset))
             flags.append("assumed_timezone")
@@ -168,6 +171,7 @@ def parse_line(line, offset="+00:00", date_order="DMY"):
                 event["process"], event["pid"] = split_tag(tag_match[1])
                 event["message"] = tag_match[2]
     if match:
+        event["input_timestamp"] = fields["ts"]
         event["timestamp"], event["flags"] = parse_timestamp(fields["ts"], offset, date_order)
         if fields.get("pri") and 0 <= int(fields["pri"]) <= 191:
             pri = int(fields["pri"])
@@ -176,6 +180,7 @@ def parse_line(line, offset="+00:00", date_order="DMY"):
 
 
 def normalize_row(row, offset="+00:00", date_order="DMY"):
+    originals = {header(k): str(v if v is not None else "") for k, v in row.items() if k is not None}
     clean = {header(k): value_or_empty(v) for k, v in row.items() if k is not None}
     fields = {field: next((clean[key] for key in keys if clean.get(key)), "")
               for field, keys in ALIASES.items()}
@@ -192,7 +197,14 @@ def normalize_row(row, offset="+00:00", date_order="DMY"):
         event["severity"] = normalize_severity(fields["severity"])
     if fields["facility"]:
         event["facility"] = normalize_facility(fields["facility"])
-    event["columns"] = {field: fields[field] for field in fields}
+    if event["severity"] not in (*SEVERITIES, UNKNOWN):
+        event["flags"].append("unrecognized_severity")
+    if event["facility"] not in (*FACILITIES, UNKNOWN):
+        event["flags"].append("unrecognized_facility")
+    event["columns"] = {
+        field: next((originals[key] for key in keys if clean.get(key)),
+                    next((originals[key] for key in keys if key in originals), ""))
+        for field, keys in ALIASES.items()}
     if not fields["message"]:
         event["flags"].append("missing_message")
     if row.get(None):
@@ -206,63 +218,131 @@ def normalize_row(row, offset="+00:00", date_order="DMY"):
     return event
 
 
-def read_events(content, filename, offset="+00:00", date_order="DMY", limit=MAX_EVENTS):
+def read_events(content, filename, offset="+00:00", date_order="DMY", limit=MAX_EVENTS, delimiter="auto"):
     offset_timezone(offset)
     if date_order not in ("DMY", "MDY"):
         raise ValueError("Ordine delle date non valido.")
+    if delimiter not in ("auto", ",", ";", "\t", "|"):
+        raise ValueError("Separatore non valido: scegli automatico, virgola, punto e virgola, tab o pipe.")
+    diag = Diagnostics()
+    rows, records_read, skipped = [], 0, 0
+    base = {"columns": [], "mapping": {}, "truncated": False, "event_limit": limit,
+            "naive_offset": offset, "date_order": date_order,
+            "format": {"type": "csv" if filename.lower().endswith(".csv") else "syslog",
+                       "delimiter": None, "delimiter_mode": delimiter}}
+    def blocked(code, value="", **location):
+        diag.add(code, value=value, **location)
+        raise ImportFailure(diag.items[code]["title"],
+                            diag.report(base, rows, records_read, skipped, blocked=True, complete=False))
     if len(content.encode("utf-8")) > MAX_FILE:
-        raise ValueError("File troppo grande: limite 30 MB in UTF-8.")
-    quality = Counter()
-    columns = []
-    mapping = {}
+        blocked("file_too_large", f"{len(content.encode('utf-8'))} byte UTF-8")
+    if "\0" in content:
+        blocked("null_bytes", "Caratteri NUL nel contenuto")
     if filename.lower().endswith(".csv"):
-        # Prefer the delimiter yielding recognized columns: message text can contain commas.
-        first = content.lstrip("\ufeff").split("\n", 1)[0]
+        text = content.lstrip("\ufeff")
+        first = next((line for line in io.StringIO(text) if line.strip()), "")
         known = {alias for aliases in ALIASES.values() for alias in aliases}
-        delimiter = max(",;\t|", key=lambda sep: sum(header(x) in known for x in next(
-            csv.reader([first], delimiter=sep), [])))
+        if delimiter == "auto":
+            delimiter = max(",;\t|", key=lambda sep: sum(header(x) in known for x in next(
+                csv.reader([first], delimiter=sep), [])))
+        base["format"]["delimiter"] = delimiter
         csv.field_size_limit(MAX_FILE)
-        reader = csv.DictReader(io.StringIO(content.lstrip("\ufeff"), newline=""), delimiter=delimiter)
-        columns = reader.fieldnames or []
-        mapping = {field: next((column for column in columns if header(column) in aliases), None)
-                   for field, aliases in ALIASES.items()}
-        def csv_events():
+        reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True)
+        columns = []
+        try:
+            for values in reader:
+                if values:
+                    columns = values
+                    break
+        except csv.Error as exc:
+            blocked("csv_syntax", str(exc), line_start=1, line_end=reader.line_num)
+        base["columns"] = columns
+        normalized = [header(column) for column in columns]
+        if columns:
+            duplicates = [name for name, count in Counter(normalized).items() if count > 1]
+            if duplicates:
+                blocked("duplicate_headers", ", ".join(duplicates), line_start=1, line_end=reader.line_num)
+            if any(not name for name in normalized):
+                blocked("empty_header", "Colonna senza nome", line_start=1, line_end=reader.line_num)
+            for field, aliases in ALIASES.items():
+                matches = [column for alias in aliases for column in columns if header(column) == alias]
+                base["mapping"][field] = matches[0] if matches else None
+                if len(matches) > 1:
+                    diag.add("ambiguous_alias", column=FIELD_NAMES[field], value=" → ".join(matches),
+                             line_start=1, line_end=reader.line_num)
+            if not any(base["mapping"].values()):
+                blocked("unrecognized_columns", " | ".join(column[:60] for column in columns[:8]),
+                        line_start=1, line_end=reader.line_num)
+            for field, column in base["mapping"].items():
+                if column is None and field != "pid":
+                    diag.add("missing_column", column=FIELD_NAMES[field], value="Colonna assente",
+                             line_start=1, line_end=reader.line_num)
+        while columns:
+            line_start = reader.line_num + 1
             try:
-                for number, row in enumerate(reader, 1):
-                    event = normalize_row(row, offset, date_order)
-                    event["row"] = number
-                    event["line"] = reader.line_num
-                    yield event
+                values = next(reader)
+            except StopIteration:
+                break
             except csv.Error as exc:
-                raise ValueError(f"CSV non valido vicino alla riga {reader.line_num}: {exc}") from exc
-        source = csv_events()
+                if records_read >= limit:
+                    base["truncated"] = True
+                    diag.add("event_limit", value=f"Limite: {limit} record")
+                    break
+                blocked("csv_syntax", str(exc), record=records_read + 1,
+                        line_start=line_start, line_end=reader.line_num)
+            if not values:
+                continue
+            if records_read >= limit:
+                base["truncated"] = True
+                diag.add("event_limit", value=f"Limite: {limit} record")
+                break
+            records_read += 1
+            if len(values) != len(columns):
+                code = "extra_csv_fields" if len(values) > len(columns) else "missing_csv_fields"
+                diag.add(code, record=records_read, line_start=line_start, line_end=reader.line_num,
+                         value=f"Attese {len(columns)} colonne; trovate {len(values)}. " +
+                               " | ".join(value[:40] for value in values[:4]))
+                skipped += 1
+                continue
+            event = normalize_row(dict(zip(columns, values)), offset, date_order)
+            event.update(row=records_read, line_start=line_start, line=reader.line_num)
+            rows.append(event)
     else:
-        def text_events():
-            for number, line in enumerate(io.StringIO(content), 1):
-                if line.strip():
-                    event = parse_line(line, offset, date_order)
-                    event.update(row=number, line=number)
-                    yield event
-        source = text_events()
-    rows = list(islice(source, limit + 1))
-    truncated = len(rows) > limit
-    rows = rows[:limit]
+        for number, line in enumerate(io.StringIO(content), 1):
+            if not line.strip():
+                continue
+            if records_read >= limit:
+                base["truncated"] = True
+                diag.add("event_limit", value=f"Limite: {limit} record")
+                break
+            records_read += 1
+            event = parse_line(line, offset, date_order)
+            event.update(row=number, line_start=number, line=number)
+            rows.append(event)
     seen = set()
     for row in rows:
         signature = hashlib.blake2b(repr(tuple(row[key] for key in (
             "timestamp", "host", "host_ip", "process", "pid", "facility", "severity", "raw"))).encode("utf-8"), digest_size=16).digest()
         if signature in seen:
-            quality["identical_records"] += 1
+            row["flags"].append("identical_records")
         seen.add(signature)
-        quality.update(row["flags"])
         if row["host"] == UNKNOWN:
-            quality["missing_host"] += 1
+            row["flags"].append("missing_host")
         if row["process"] == UNKNOWN:
-            quality["missing_process"] += 1
+            row["flags"].append("missing_process")
+        for flag in row["flags"]:
+            field = {"invalid_host_ip": "host_ip", "unrecognized_severity": "severity",
+                     "unrecognized_facility": "facility"}.get(flag, flag.removeprefix("missing_"))
+            if flag in ("invalid_timestamp", "assumed_timezone", "ambiguous_date", "inferred_year"):
+                field = "timestamp"
+            diag.add(flag, event=row, column=base["mapping"].get(field))
         row["epoch"] = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")).timestamp() if row["timestamp"] else None
         # Missing identities are kept separate; do not correlate unrelated unknown hosts.
         row["host_key"] = row["host"] if row["host"] != UNKNOWN else (
             row["host_ip"] if clean_ip(row["host_ip"]) else f"unknown-row-{row['row']}")
-    return rows, {"counts": dict(quality), "columns": columns, "mapping": mapping,
-                  "truncated": truncated, "event_limit": limit, "naive_offset": offset,
-                  "date_order": date_order}
+    if not records_read:
+        diag.add("no_records", value="File vuoto o senza record dopo l'intestazione")
+    if not rows and skipped:
+        raise ImportFailure("Nessun record CSV con struttura valida.",
+                            diag.report(base, rows, records_read, skipped, blocked=True, complete=not base["truncated"]))
+    return rows, diag.report(base, rows, records_read, skipped, complete=not base["truncated"])

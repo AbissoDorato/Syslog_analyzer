@@ -19,20 +19,30 @@
       <label class="setting">Finestra <input id="window" type="number" value="5" min="1" max="1440"> min</label>
       <label class="setting">Moltiplicatore <input id="threshold" type="number" value="2" min="1.1" max="100" step="0.1"> ×</label>
       <label class="setting">Min. eventi <input id="minEvents" type="number" value="5" min="3" max="100000"></label>
+      <label class="setting history-choice"><input id="useHistory" type="checkbox" checked> Considera lo storico della macchina</label>
       <label class="setting">Fuso se assente <input id="offset" type="text" value="+00:00" aria-label="Fuso per timestamp privi di timezone"></label>
       <label class="setting">Date con slash <select id="dateOrder"><option value="DMY">giorno/mese/anno</option><option value="MDY">mese/giorno/anno</option></select></label>
+      <label class="setting">Separatore CSV <select id="delimiter"><option value="auto">Automatico</option><option value=",">Virgola (,)</option><option value=";">Punto e virgola (;)</option><option value="tab">Tabulazione</option><option value="|">Pipe (|)</option></select></label>
       <button class="btn" id="reanalyze" disabled>Ricalcola</button>
-      <div class="hint">Baseline per host/processo: fino a 12 finestre precedenti, almeno 3. Si applicano soglia relativa e scostamento dalla mediana.</div>
+      <div class="hint" id="methodHint">Storico: fino a 12 finestre precedenti dello stesso host nel file caricato, almeno 3. Premi Ricalcola dopo aver modificato le impostazioni.</div>
     </div>
   </section>
   <div class="alert" id="alert" role="alert"></div>
   <p id="fileline" class="hint" role="status" aria-live="polite">In attesa di un file.</p>
+  <section class="card block" id="quality" hidden aria-label="Diagnostica importazione">
+    <div class="cardhead"><h3>Diagnostica importazione</h3><span id="importStatus" role="status"></span></div>
+    <p class="hint">Queste segnalazioni riguardano il file e la sua lettura. I livelli SecurityLevel dei syslog sono analizzati separatamente.</p>
+    <div id="qualitySummary" class="metrics"></div>
+    <p id="importFormat" class="hint"></p>
+    <div class="toolbar"><label>Mostra <select id="diagnosticFilter"><option value="">Tutte le segnalazioni</option><option value="error">Errori di importazione</option><option value="warning">Avvisi</option><option value="info">Assunzioni / informazioni</option></select></label><button id="downloadImport" class="btn">Scarica diagnosi .json</button></div>
+    <div id="qualityBody"></div>
+    <details><summary>Intestazioni e colonne riconosciute</summary><div class="tablewrap" id="columnMapping"></div></details>
+  </section>
   <section id="results" hidden>
-    <details class="card" id="quality"><summary>Qualità dell'input e colonne riconosciute</summary><div id="qualityBody"></div></details>
     <section class="metrics">
       <div class="metric"><label>Eventi analizzati</label><b id="total">—</b><span>tutto il file importato</span></div>
       <div class="metric"><label>Processi</label><b id="processCount">—</b><span>nomi distinti</span></div>
-      <div class="metric"><label>Finestre con spike</label><b id="spikeCount">—</b><span>per host o processo</span></div>
+      <div class="metric"><label id="spikeLabel">Finestre con spike</label><b id="spikeCount">—</b><span id="spikeHint">per host o processo</span></div>
       <div class="metric"><label>Timestamp validi</label><b id="timed">—</b><span>grafici e dossier in UTC</span></div>
     </section>
     <section class="card block">
@@ -42,6 +52,7 @@
     </section>
     <section class="card block">
       <div class="cardhead"><h3>Dossier per il ticket</h3><span id="incidentCount"></span></div>
+      <p class="hint" id="analysisNotes"></p>
       <div class="toolbar"><label>Host <select id="hostFilter"></select></label><label class="grow">Finestra <select id="incidentSelect"></select></label></div>
       <div id="incidentEmpty" class="empty" hidden>Nessun dossier: servono timestamp e Computer o HostIP valido. Controlla la qualità dell'input.</div>
       <div id="incidentBody">

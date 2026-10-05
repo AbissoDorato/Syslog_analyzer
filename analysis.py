@@ -21,8 +21,12 @@ def iso(epoch):
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def baseline(counter, bucket, beginning, seconds, threshold, minimum):
+def baseline(counter, bucket, beginning, seconds, threshold, minimum, use_history=True):
     count = counter.get(bucket, 0)
+    if not use_history:
+        return {"baseline": None, "baseline_windows": 0, "median": None, "mad": None,
+                "cutoff": minimum, "detected": False, "flagged": count >= minimum,
+                "ratio": None}
     previous = [counter.get(bucket - offset * seconds, 0)
                 for offset in range(1, LOOKBACK + 1) if bucket - offset * seconds >= beginning]
     mean = sum(previous) / len(previous) if previous else 0
@@ -32,7 +36,7 @@ def baseline(counter, bucket, beginning, seconds, threshold, minimum):
     cutoff = max(minimum, math.ceil(mean * threshold), math.floor(center + 3 * 1.4826 * mad) + 1)
     detected = len(previous) >= MIN_BASELINE and count >= cutoff and count > mean
     return {"baseline": round(mean, 3), "baseline_windows": len(previous),
-            "median": center, "mad": mad, "cutoff": cutoff, "detected": detected,
+            "median": center, "mad": mad, "cutoff": cutoff, "detected": detected, "flagged": detected,
             "ratio": round(count / mean, 2) if mean else None}
 
 
@@ -134,12 +138,13 @@ def correlations(events, seconds):
     return result
 
 
-def build_incident(host, bucket, events, stats, contributors, buckets, seconds, filename, file_hash, quality):
+def build_incident(host, bucket, events, stats, contributors, buckets, seconds, filename, file_hash, quality, use_history):
     total = len(events)
     category_counts = Counter(e["category"] for e in events)
     previous_categories = Counter()
-    for offset in range(1, LOOKBACK + 1):
-        previous_categories.update(e["category"] for e in buckets.get((host, bucket - offset * seconds), []))
+    if use_history:
+        for offset in range(1, LOOKBACK + 1):
+            previous_categories.update(e["category"] for e in buckets.get((host, bucket - offset * seconds), []))
     suggestions = hypotheses(events, previous_categories)
     by_row = {e["row"]: e for e in events}
     # Include evidence for every displayed rule, even if its events occurred after the first 30.
@@ -155,6 +160,7 @@ def build_incident(host, bucket, events, stats, contributors, buckets, seconds, 
         chosen.setdefault(event["row"], event)
     network = [e for e in events if e["network"]["src"] or e["network"]["dst"]]
     incident = {"id": hashlib.sha256(f"{host}|{bucket}".encode()).hexdigest()[:16],
+                "use_history": use_history,
                 "host": host, "host_ips": sorted({e["host_ip"] for e in events if e["host_ip"] != UNKNOWN}),
                 "time": iso(bucket), "end": iso(bucket + seconds), "count": total, **stats,
                 "kind": "spike host" if stats["detected"] else (
@@ -173,22 +179,27 @@ def build_incident(host, bucket, events, stats, contributors, buckets, seconds, 
                             "distinct_ports": len({e["network"]["dst_port"] for e in network if e["network"]["dst_port"] is not None})},
                 "suggestions": suggestions, "sequences": sequences,
                 "evidence": [evidence(e) for e in sorted(chosen.values(), key=lambda e: (e["epoch"], e["row"]))]}
+    incident["flagged"] = stats["flagged"] or any(p["flagged"] for p in contributors)
+    if not use_history:
+        incident["kind"] = "soglia assoluta raggiunta (storico escluso)" if incident["flagged"] else "finestra sotto soglia (storico escluso)"
     incident["ticket"] = markdown_ticket(incident, filename, file_hash, quality)
     return incident
 
 
 def analyze(content: str, filename: str, window_minutes=5, threshold=2.0,
-            min_events=5, naive_offset="+00:00", date_order="DMY") -> dict:
+            min_events=5, naive_offset="+00:00", date_order="DMY", use_history=True, delimiter="auto") -> dict:
     if not isinstance(content, str) or not isinstance(filename, str):
         raise ValueError("Contenuto e nome del file devono essere testo.")
     if not 1 <= window_minutes <= 1440 or int(window_minutes) != window_minutes:
         raise ValueError("La finestra deve essere un intero tra 1 e 1440 minuti.")
-    if not math.isfinite(threshold) or not 1.1 <= threshold <= 100:
+    if not isinstance(use_history, bool):
+        raise ValueError("L'opzione use_history deve essere true o false.")
+    if use_history and (not math.isfinite(threshold) or not 1.1 <= threshold <= 100):
         raise ValueError("Il moltiplicatore deve essere tra 1.1 e 100.")
     if not 3 <= min_events <= 100_000 or int(min_events) != min_events:
         raise ValueError("Il minimo deve essere un intero tra 3 e 100000 eventi.")
     seconds = int(window_minutes) * 60
-    rows, quality = read_events(content, filename, naive_offset, date_order)
+    rows, quality = read_events(content, filename, naive_offset, date_order, delimiter=delimiter)
     file_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
     enrichment_cache = {}
     for event in rows:
@@ -218,25 +229,26 @@ def analyze(content: str, filename: str, window_minutes=5, threshold=2.0,
     candidates = []
     peaks = {}
     for (host, bucket), events in buckets.items():
-        stats = baseline(host_counts[host], bucket, host_begin[host], seconds, threshold, min_events)
+        stats = baseline(host_counts[host], bucket, host_begin[host], seconds, threshold, min_events, use_history)
         processes = Counter(e["process"] for e in events)
         contributors = []
         for proc, count in processes.most_common():
-            proc_stats = baseline(proc_counts[(host, proc)], bucket, host_begin[host], seconds, threshold, min_events)
+            proc_stats = baseline(proc_counts[(host, proc)], bucket, host_begin[host], seconds, threshold, min_events, use_history)
             if proc == UNKNOWN:
                 proc_stats["detected"] = False
+                proc_stats["flagged"] = False
             contributors.append({"name": proc, "count": count, "percent": round(100 * count / len(events), 2), **proc_stats})
         candidate = (host, bucket, events, stats, contributors)
-        if stats["detected"] or any(p["detected"] for p in contributors):
+        if stats["flagged"] or any(p["flagged"] for p in contributors):
             candidates.append(candidate)
         if host not in peaks or len(events) > len(peaks[host][2]):
             peaks[host] = candidate
     hosts_with_spikes = {candidate[0] for candidate in candidates}
     candidates += [peak for host, peak in peaks.items() if host not in hosts_with_spikes]
     candidates.sort(key=lambda c: (
-        -(c[3]["detected"] or any(p["detected"] for p in c[4])),
-        -(len(c[2]) - c[3]["baseline"]), -len(c[2]), c[0], c[1]))
-    incidents = [build_incident(*candidate, buckets, seconds, filename, file_hash, quality)
+        -(c[3]["flagged"] or any(p["flagged"] for p in c[4])),
+        -(len(c[2]) - (c[3]["baseline"] or 0)), -len(c[2]), c[0], c[1]))
+    incidents = [build_incident(*candidate, buckets, seconds, filename, file_hash, quality, use_history)
                  for candidate in candidates[:MAX_INCIDENTS]]
     tree, tree_total = temporal_tree(rows, seconds)
     chart = []
@@ -256,31 +268,17 @@ def analyze(content: str, filename: str, window_minutes=5, threshold=2.0,
     for event in rows:
         process_messages[event["process"]][event["template"]] += 1
     spike_count = sum(c[3]["detected"] or any(p["detected"] for p in c[4]) for c in candidates)
-    warnings = []
-    warning_labels = {"invalid_timestamp": "timestamp non riconosciuti", "missing_timestamp": "timestamp mancanti",
-                      "assumed_timezone": f"timestamp senza fuso, interpretati come {naive_offset}",
-                      "inferred_year": "date senza anno, assunto l'anno corrente UTC",
-                      "missing_host": "host mancanti (correlati solo se HostIP valido)",
-                      "missing_process": "processi mancanti", "missing_message": "messaggi mancanti",
-                      "identical_records": "record identici già osservati, conservati: verificare eventuali duplicazioni dell'export",
-                      "extra_csv_fields": "record con colonne in eccesso", "missing_csv_fields": "record con colonne mancanti",
-                      "invalid_host_ip": "HostIP non validi"}
-    warnings += [f"{count} {warning_labels.get(key, key)}." for key, count in quality["counts"].items() if count]
-    if quality["mapping"]:
-        missing = [name for name in ("timestamp", "host", "facility", "severity", "message", "process", "host_ip")
-                   if not quality["mapping"].get(name)]
-        if missing:
-            warnings.append("Colonne non mappate: " + ", ".join(missing) + ".")
-    if quality["truncated"]:
-        warnings.append(f"Input limitato ai primi {quality['event_limit']} eventi; i conteggi sono parziali.")
+    flagged_count = sum(c[3]["flagged"] or any(p["flagged"] for p in c[4]) for c in candidates)
+    analysis_warnings = []
     if len(candidates) > MAX_INCIDENTS:
-        warnings.append(f"Mostrati {MAX_INCIDENTS}/{len(candidates)} dossier, ordinati per anomalia ed eccesso di eventi.")
-    quality["warnings"] = warnings
+        analysis_warnings.append(f"Mostrati {MAX_INCIDENTS}/{len(candidates)} dossier, ordinati per segnalazione e volume di eventi.")
     return {"total": total, "process_count": sum(p != UNKNOWN for p in processes), "parsed": total - processes[UNKNOWN],
             "with_timestamp": len(timed), "quality": quality,
             "source": {"filename": filename, "sha256": file_hash}, "catalog_version": CATALOG["version"],
-            "parameters": {"window_minutes": window_minutes, "threshold": threshold, "min_events": min_events,
-                           "lookback": LOOKBACK, "minimum_baseline_windows": MIN_BASELINE},
+            "parameters": {"window_minutes": window_minutes, "threshold": threshold if use_history else None, "min_events": min_events,
+                           "lookback": LOOKBACK if use_history else 0, "minimum_baseline_windows": MIN_BASELINE if use_history else 0,
+                           "use_history": use_history, "delimiter": delimiter},
+            "flagged_window_count": flagged_count, "analysis_warnings": analysis_warnings,
             "spike_count": spike_count, "incident_count": len(candidates), "incidents": incidents,
             "processes": [{"name": p, "count": count, "percent": round(100 * count / total, 2) if total else 0,
                            "messages": [{"message": msg, "count": num} for msg, num in process_messages[p].most_common(5)]}

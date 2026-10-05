@@ -31,10 +31,11 @@ La pagina è disponibile su `http://127.0.0.1:8765`. L'opzione `--port 9000` cam
 ## Flusso di lavoro
 
 1. Carica CSV, TXT o LOG (massimo 30 MB). Sono letti UTF-8 e UTF-16 con BOM; il contenuto decodificato deve rientrare in 30 MB UTF-8.
-2. Controlla colonne riconosciute e avvisi di qualità. Imposta il fuso per date che ne sono prive e l'ordine giorno/mese delle date con slash.
-3. Seleziona host e finestra nel **Dossier per il ticket**. Leggi conteggi, categorie, processi, suggerimenti ed evidenze.
-4. Scegli una causa dal catalogo oppure lascia **Causa da determinare**. Una causa scelta manualmente viene indicata come tale se le soglie della regola non sono soddisfatte.
-5. Modifica il Markdown e copia il ticket, scarica `.md` o esporta il dossier `.json`. La scelta della causa e le modifiche vengono conservate in memoria quando cambi finestra. Un nuovo caricamento o ricalcolo le azzera.
+2. Controlla la **Diagnostica importazione**. Imposta separatore CSV, fuso per date che ne sono prive e ordine giorno/mese delle date con slash.
+3. Scegli se **considerare lo storico della macchina**, quindi premi **Ricalcola** per applicare le impostazioni.
+4. Seleziona host e finestra nel **Dossier per il ticket**. Leggi conteggi, categorie, processi, suggerimenti ed evidenze.
+5. Scegli una causa dal catalogo oppure lascia **Causa da determinare**. Una causa scelta manualmente viene indicata come tale se le soglie della regola non sono soddisfatte.
+6. Modifica il Markdown e copia il ticket, scarica `.md` o esporta il dossier `.json`. La scelta della causa e le modifiche vengono conservate in memoria quando cambi finestra. Un nuovo caricamento o ricalcolo le azzera.
 
 Non vengono creati ticket su servizi esterni. I dati restano in memoria; diventano file solo quando scegli di scaricarli. I report contengono estratti dei log: rivedili prima di condividerli.
 
@@ -44,6 +45,26 @@ Carica [`examples/demo.csv`](examples/demo.csv), che contiene dati sintetici. Co
 
 - `pc-a`: 30 eventi nella finestra delle 10:15 UTC, di cui 24 retry (**80%**), contro 1 evento/finestra nello storico. Suggerimento: ciclo di retry o servizio remoto non raggiungibile.
 - `pc-b`: 15 fallimenti di autenticazione e un accesso riuscito dallo stesso IP e utente. Sono suggeriti sia problemi di credenziali sia un approfondimento compatibile con T1110. Nessun attacco viene dichiarato confermato.
+
+## Diagnostica dell'importazione
+
+Il pannello è visibile anche quando l'import fallisce. Le segnalazioni riguardano **la lettura del file**: un evento con `SecurityLevel=error` non è di per sé un errore di importazione.
+
+Il riepilogo distingue record esaminati, analizzati, esclusi e utilizzabili nelle finestre temporali. Mostra formato, codifica, separatore e colonne riconosciute. Puoi filtrare errori, avvisi e informazioni e scaricare la diagnosi in JSON.
+
+Ogni problema indica effetto sull'analisi, correzione consigliata e fino a **5 esempi**, con numero di record, righe fisiche iniziale/finale, colonna e valore originale (massimo 240 caratteri). I conteggi includono tutte le occorrenze esaminate; più problemi possono interessare lo stesso record.
+
+| Problema | Comportamento |
+|---|---|
+| Record con troppe/poche colonne | Il record è escluso; gli altri vengono analizzati. L'import è indicato come parziale. |
+| Timestamp non valido o mancante | Il record resta nei conteggi generali, ma non nelle finestre temporali. |
+| HostIP non valido | È conservato per la diagnosi, ma non usato per dedurre direzione o identità dell'host. |
+| Date ambigue, fuso/anno assunti, campi mancanti o personalizzati | Segnalazione con interpretazione applicata e istruzioni per correggere l'export. |
+| Intestazioni duplicate/vuote o nessuna colonna riconosciuta | Import bloccato per evitare interpretazioni silenziosamente errate. |
+| Apici CSV non chiusi o sintassi non recuperabile | Import bloccato; anche il prefisso letto prima dell'errore non viene analizzato. |
+| Codifica non valida, caratteri NUL o file oltre limite | Import bloccato con indicazioni per riesportare il file. |
+
+Il **separatore CSV** può essere automatico o impostato manualmente (virgola, punto e virgola, tab, pipe). I messaggi contenenti il separatore devono essere quotati secondo il formato CSV. Gli errori interni del server vengono segnalati separatamente e non sono attribuiti automaticamente ai dati.
 
 ## Colonne CSV
 
@@ -64,6 +85,13 @@ I campi espliciti del CSV hanno precedenza sul messaggio. Un `TimeGenerated` pre
 Per TXT/LOG sono riconosciuti syslog RFC 3164, RFC 5424 e prefissi ISO con host e tag del processo. PID e facility vengono estratti quando disponibili. Le date vengono normalizzate in **UTC**: i timestamp senza fuso usano l'offset scelto (predefinito `+00:00`); quelli RFC 3164 senza anno usano l'anno corrente UTC con avviso. Per log che attraversano cambi d'ora legale, preferisci un export con offset esplicito.
 
 ## Rilevamento dei picchi
+
+La casella **Considera lo storico della macchina** è attiva per impostazione predefinita. Lo storico è costituito dalle finestre precedenti dello stesso host **nel file caricato**: non viene conservato tra caricamenti.
+
+- **Storico incluso:** confronto relativo descritto sotto, con media, mediana/MAD e variazione delle percentuali rispetto al periodo precedente.
+- **Storico escluso:** ogni finestra viene valutata usando solo **Min. eventi**. Si segnalano le finestre che raggiungono questa soglia assoluta, senza chiamarle spike rispetto al passato. Moltiplicatore, baseline, rapporto e variazione storica delle percentuali non sono applicati. Categorie, regole locali, sequenze nella finestra e ticket restano disponibili.
+
+La modalità viene riportata nel dossier, nel ticket e nell'export JSON. Il grafico e l'albero continuano a mostrare i dati del file: la casella controlla il confronto con il passato, non elimina record dall'import.
 
 La rilevazione avviene separatamente per **host** e per **host + nome del processo**. Un aumento di un processo può quindi essere individuato anche se il totale dell'host rimane stabile.
 
@@ -132,6 +160,7 @@ Il ticket include host/IP, finestra UTC, baseline, categorie, processi, ipotesi,
 |---|---|
 | `app.py` | Server HTTP su loopback, validazione richieste e file statici |
 | `parsing.py` | Colonne, formati syslog, date e qualità dell'input |
+| `import_diagnostics.py` | Diagnosi dell'import, esempi limitati, conteggi e istruzioni di correzione |
 | `analysis.py` | Finestre per host/processo, baseline, correlazioni e dossier |
 | `insights.py` | Regole locali, endpoint espliciti, evidenze e testo ticket |
 | `catalog.json` | Cause predefinite, categorie, soglie, verifiche e MITRE |

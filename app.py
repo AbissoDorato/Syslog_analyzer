@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from analysis import analyze
 from parsing import MAX_FILE, normalize_row, parse_line, timestamp
+from import_diagnostics import ImportFailure
 
 ROOT = Path(__file__).resolve().parent
 # JSON escaping can expand a 30 MB text file to six times its UTF-8 size.
@@ -74,17 +75,22 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Il corpo deve essere un oggetto JSON.")
             result = analyze(data.get("content", ""), data.get("filename", "log.txt"),
                              window_minutes=float(data.get("window", 5)),
-                             threshold=float(data.get("threshold", 2)),
+                             threshold=2.0 if data.get("use_history") is False else float(data.get("threshold", 2)),
                              min_events=float(data.get("min_events", 5)),
                              naive_offset=data.get("naive_offset", "+00:00"),
-                             date_order=data.get("date_order", "DMY"))
+                             date_order=data.get("date_order", "DMY"),
+                             use_history=data.get("use_history", True),
+                             delimiter=data.get("delimiter", "auto"))
             self.respond(200, json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+        except ImportFailure as exc:
+            self.respond(422, json.dumps({"error": str(exc), "error_type": "import", "quality": exc.report},
+                                        ensure_ascii=False).encode("utf-8"))
         except (ValueError, TypeError, OverflowError) as exc:
             self.error_json(400, str(exc))
         except (TimeoutError, ConnectionError):
             self.close_connection = True
         except Exception:
-            self.error_json(500, "Errore interno durante l'analisi. Verificare il formato del file.")
+            self.error_json(500, "Errore interno dell'analizzatore; questo non dimostra un problema nel file.")
 
     def log_message(self, *_):
         pass

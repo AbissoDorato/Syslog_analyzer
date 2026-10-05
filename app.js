@@ -6,6 +6,7 @@ const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({
 })[c]);
 const time = value => (value || "senza timestamp").replace("T", " ").replace("Z", " UTC");
 let data = null, lastFile = null, active = null, requestId = 0, controller = null;
+let importReport = null, importSource = null;
 const drafts = new Map();
 const choices = new Map();
 
@@ -27,38 +28,120 @@ function bars(node, rows) {
     fmt(r.count) + '</span></div><div class="hint">' + fmt(r.percent ?? 0) + "%</div>").join("");
 }
 
+function updateHistoryControls() {
+  const enabled = $("#useHistory").checked;
+  $("#threshold").disabled = !enabled;
+  $("#methodHint").textContent = enabled ?
+    "Storico: fino a 12 finestre precedenti dello stesso host nel file caricato, almeno 3. Premi Ricalcola per applicare le modifiche." :
+    "Storico escluso: ogni finestra è valutata sul solo Min. eventi. Non dimostra uno spike rispetto al passato. Premi Ricalcola per applicare le modifiche.";
+}
+
+function renderImportReport(report) {
+  importReport = report;
+  $("#quality").hidden = false;
+  $("#importStatus").textContent = ({
+    ok:"Import riuscito", warning:"Import riuscito con segnalazioni",
+    partial:"Import parziale", blocked:"Import bloccato", empty:"Nessun evento importato"
+  })[report.status] || report.status;
+  $("#importStatus").className = "import-status " + report.status;
+  const s = report.summary;
+  const number = n => n === null || n === undefined ? "—" : fmt(n);
+  $("#qualitySummary").innerHTML = [
+    ["Record esaminati",s.records_read,s.complete ? "lettura completata" : "lettura non completata"],
+    ["Record analizzati",s.analyzed_records,"inclusi nei risultati"],
+    ["Record esclusi",s.skipped_records,"struttura CSV incoerente"],
+    ["Utilizzabili nelle finestre",s.usable_for_windows,"timestamp e host utilizzabili"]
+  ].map(([label,n,note])=>'<div class="metric"><label>'+esc(label)+"</label><b>"+number(n)+"</b><span>"+esc(note)+"</span></div>").join("");
+  const sep = {",":"virgola",";":"punto e virgola","\t":"tabulazione","|":"pipe"}[report.format.delimiter] || "non applicabile / non rilevato";
+  $("#importFormat").textContent = "Formato: " + report.format.type + " · separatore: " + sep +
+    " · codifica: " + (importSource?.encoding || "testo UTF-8 analizzato") + " · record con segnalazioni: " +
+    number(s.records_with_issues) + ". Più segnalazioni possono riguardare lo stesso record." +
+    (s.parsed_before_block ? " Prima del blocco erano stati letti " + s.parsed_before_block + " record: non sono stati analizzati." : "");
+  const mapping = Object.entries(report.mapping || {});
+  $("#columnMapping").innerHTML = "<p>Intestazioni: " + esc((report.columns || []).join(" | ") || "nessuna intestazione CSV") + "</p>" +
+    table(["Campo","Colonna / alias prioritario"],mapping.map(([field,column])=>[esc(field),esc(column || "assente")]));
+  renderDiagnosticIssues();
+}
+
+function renderDiagnosticIssues() {
+  if (!importReport) return;
+  const level = $("#diagnosticFilter").value;
+  const labels = {error:"Errore",warning:"Avviso",info:"Informazione"};
+  const issues = importReport.diagnostics.filter(d => !level || d.level === level);
+  $("#qualityBody").innerHTML = issues.map(d => '<details class="import-issue '+esc(d.level)+'"' +
+    (d.level === "error" ? " open" : "") + '><summary><b>'+esc(labels[d.level])+" · "+esc(d.title)+"</b> · "+fmt(d.count)+
+    '</summary><p><b>Effetto:</b> '+esc(d.impact)+'</p><p><b>Come correggere:</b> '+esc(d.action)+
+    '</p><div class="tablewrap">'+table(["Record","Righe fisiche","Colonna","Valore / dettaglio originale"],
+      d.examples.map(x=>[x.record == null ? "File / intestazione" : "#"+fmt(x.record),
+        x.line_start == null ? "—" : fmt(x.line_start)+(x.line_end !== x.line_start ? "–"+fmt(x.line_end) : ""),
+        esc(x.column || "struttura del file"),'<span class="event-text">'+esc(x.value || "(vuoto)")+"</span>"]))+
+    '</div><p class="hint">Esempi '+d.examples.length+" su "+d.count+" segnalazioni; valori mostrati fino a 240 caratteri.</p></details>").join("") ||
+    '<p class="hint">Nessuna segnalazione '+(level ? "per questo filtro." : "di importazione.")+"</p>";
+}
+
+function clientImportFailure(code, title, detail, action) {
+  renderImportReport({status:"blocked",format:{type:"file",delimiter:null},columns:[],mapping:{},
+    counts:{[code]:1},summary:{records_read:null,analyzed_records:0,skipped_records:null,
+      usable_for_windows:0,records_with_issues:0,complete:false},
+    diagnostics:[{code,level:"error",title,impact:detail,action,count:1,
+      examples:[{record:null,line_start:null,line_end:null,column:"file",value:importSource?.filename || ""}]}]});
+  error(title + ". " + action);
+  $("#fileline").textContent = "Import bloccato: " + (importSource?.filename || "");
+}
+
 async function loadFile(file) {
   controller?.abort();
   const id = ++requestId;
   controller = new AbortController();
   $("#alert").style.display = "none";
   $("#results").hidden = true;
+  $("#quality").hidden = true;
+  $("#diagnosticFilter").value = "";
+  $("#reanalyze").disabled = true;
+  importReport = null;
+  importSource = {filename:file.name,bytes:file.size};
   active = null;
   data = null;
   drafts.clear();
   choices.clear();
-  if (file.size > 30 * 1024 * 1024) { error("Il file supera 30 MB."); return; }
-  if (!/\.(csv|txt|log)$/i.test(file.name)) { error("Seleziona un file CSV, TXT o LOG."); return; }
+  if (file.size > 30 * 1024 * 1024) {
+    clientImportFailure("file_size","Il file supera 30 MB","Nessun record è stato letto.","Suddividi l'export in file più piccoli."); return;
+  }
+  if (!/\.(csv|txt|log)$/i.test(file.name)) {
+    clientImportFailure("file_type","Formato non supportato","Nessun record è stato letto.","Esporta un CSV, TXT o LOG; un file XLSX non è un CSV."); return;
+  }
   lastFile = file;
   $("#reanalyze").disabled = true;
   $("#fileline").textContent = "Analisi locale di " + file.name + "…";
   try {
     const bytes = new Uint8Array(await file.arrayBuffer());
+    if (id !== requestId) return;
     const encoding = bytes[0] === 0xff && bytes[1] === 0xfe ? "utf-16le" :
       bytes[0] === 0xfe && bytes[1] === 0xff ? "utf-16be" : "utf-8";
+    importSource.encoding = encoding;
     let content;
     try { content = new TextDecoder(encoding, {fatal:true}).decode(bytes); }
-    catch { throw new Error("Codifica non riconosciuta. Esporta il file in UTF-8 o UTF-16 con BOM."); }
+    catch {
+      clientImportFailure("encoding","Codifica del file non riconosciuta","Il testo non può essere decodificato senza perdere caratteri.",
+        "Esporta il file in UTF-8 o UTF-16 con BOM.");
+      $("#fileline").textContent = "Import bloccato durante la lettura del file.";
+      return;
+    }
     if (id !== requestId) return;
     const response = await fetch("/api/analyze", {
       method:"POST", signal:controller.signal, headers:{"Content-Type":"application/json"},
       body:JSON.stringify({filename:file.name, content, window:Number($("#window").value),
         threshold:Number($("#threshold").value), min_events:Number($("#minEvents").value),
-        naive_offset:$("#offset").value.trim(), date_order:$("#dateOrder").value})
+        naive_offset:$("#offset").value.trim(), date_order:$("#dateOrder").value,
+        use_history:$("#useHistory").checked,
+        delimiter:$("#delimiter").value === "tab" ? "\t" : $("#delimiter").value})
     });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error || "Analisi non riuscita");
     if (id !== requestId) return;
+    if (!response.ok) {
+      if (result.quality) renderImportReport(result.quality);
+      throw new Error(result.error || "Analisi non riuscita");
+    }
     data = result;
     render();
     $("#fileline").textContent = file.name + " · " + fmt(data.total) + " eventi · catalogo " + data.catalog_version;
@@ -76,13 +159,12 @@ async function loadFile(file) {
 function render() {
   $("#total").textContent = fmt(data.total);
   $("#processCount").textContent = fmt(data.process_count);
-  $("#spikeCount").textContent = fmt(data.spike_count);
+  $("#spikeCount").textContent = fmt(data.flagged_window_count);
+  $("#spikeLabel").textContent = data.parameters.use_history ? "Finestre con spike" : "Finestre a soglia assoluta";
+  $("#spikeHint").textContent = data.parameters.use_history ? "confronto con lo storico" : "storico escluso";
   $("#timed").textContent = (data.total ? fmt(100 * data.with_timestamp / data.total) : "0") + "%";
-  const warnings = data.quality.warnings;
-  $("#quality").open = warnings.length > 0;
-  $("#qualityBody").innerHTML = (warnings.length ? '<ul class="quality-list">' + warnings.map(w => "<li>" + esc(w) + "</li>").join("") + "</ul>" :
-    "<p>Nessuna anomalia di parsing segnalata.</p>") +
-    table(["Campo", "Colonna riconosciuta"], Object.entries(data.quality.mapping).map(([field, column]) => [esc(field), esc(column || "assente")]));
+  renderImportReport(data.quality);
+  $("#analysisNotes").textContent = (data.analysis_warnings || []).join(" ");
   $("#hostFilter").innerHTML = '<option value="">Tutti gli host</option>' +
     [...new Set(data.incidents.map(i => i.host))].map(host => '<option value="' + esc(host) + '">' + esc(host) + "</option>").join("");
   $("#incidentCount").textContent = fmt(data.incidents.length) + " / " + fmt(data.incident_count) + " finestre";
@@ -112,22 +194,26 @@ function selectIncident() {
   active = data.incidents.find(i => i.id === $("#incidentSelect").value);
   if (!active) return;
   $("#ticketStatus").textContent = "";
-  const ratio = active.ratio === null ? "baseline nulla: rapporto non definito" : fmt(active.ratio) + "× rispetto alla baseline host";
+  const ratio = active.ratio === null ? "rapporto non disponibile" : fmt(active.ratio) + "× rispetto alla baseline host";
+  const reference = active.use_history ?
+    ratio + "<br>Baseline host: " + fmt(active.baseline) + " eventi su " + active.baseline_windows +
+      " finestre precedenti. Soglia host: " + fmt(active.cutoff) + " eventi." +
+      (active.baseline_windows < 3 ? "<br>Storico insufficiente per dimostrare uno spike." : "") +
+      "<br>Gli intervalli senza log valgono zero: verificare la continuità della raccolta." :
+    "Storico escluso: soglia assoluta di " + fmt(active.cutoff) + " eventi. Nessun confronto con il passato; non dimostra uno spike relativo.";
   $("#incidentSummary").innerHTML = "<b>" + esc(active.host) + "</b> · " + esc(time(active.time)) + " → " + esc(time(active.end)) +
-    "<br><b>" + fmt(active.count) + " eventi</b> · " + esc(active.kind) + " · " + ratio +
-    "<br>Baseline host: " + fmt(active.baseline) + " eventi su " + active.baseline_windows +
-    " finestre precedenti. Soglia host: " + fmt(active.cutoff) + " eventi." +
-    (active.baseline_windows < 3 ? "<br>Storico insufficiente per dimostrare uno spike." : "") +
-    "<br>Gli intervalli senza log valgono zero: verificare la continuità della raccolta.";
+    "<br><b>" + fmt(active.count) + " eventi</b> · " + esc(active.kind) + "<br>" + reference;
   bars($("#categoryList"), active.categories);
-  $("#contributorList").innerHTML = table(["Processo","Eventi","Quota","Baseline / anomalia"], active.processes.slice(0,30).map(p => [
-    esc(p.name), fmt(p.count), fmt(p.percent) + "%", fmt(p.baseline) + (p.detected ? " · spike" : "")
+  $("#contributorList").innerHTML = table(["Processo","Eventi","Quota",active.use_history ? "Baseline / anomalia" : "Soglia assoluta"], active.processes.slice(0,30).map(p => [
+    esc(p.name), fmt(p.count), fmt(p.percent) + "%", active.use_history ?
+      fmt(p.baseline) + (p.detected ? " · spike" : "") : fmt(p.cutoff) + (p.flagged ? " · raggiunta" : "")
   ])) + (active.processes.length > 30 ? '<p class="hint">Mostrati i primi 30 processi; elenco completo nel dossier JSON.</p>' : "");
   $("#suggestions").innerHTML = "<h4>Possibili cause dal catalogo locale</h4>" + (active.suggestions.length ?
     active.suggestions.map(s => '<article class="suggestion"><h4>' + esc(s.title) + '</h4><span class="badge">' + esc(s.kind) +
       '</span><span class="badge">' + esc(s.support) + "</span><p>" + esc(s.reason) + "</p>" +
       (s.delta_pp !== null ? '<p class="hint">Prima: ' + fmt(s.baseline_percent) + "%; variazione " +
-        (s.delta_pp >= 0 ? "+" : "") + fmt(s.delta_pp) + " punti percentuali.</p>" : '<p class="hint">Nessun evento precedente per confrontare la composizione.</p>') +
+        (s.delta_pp >= 0 ? "+" : "") + fmt(s.delta_pp) + " punti percentuali.</p>" : '<p class="hint">' +
+          (active.use_history ? "Nessun evento precedente per confrontare la composizione." : "Confronto storico disattivato; quota riferita solo alla finestra selezionata.") + "</p>") +
       "<ul>" + s.checks.map(check => "<li>" + esc(check) + "</li>").join("") + "</ul>" +
       s.mitre_refs.map(ref => '<p>Riferimento MITRE da validare: <a href="' + esc(ref.url) + '" target="_blank" rel="noopener noreferrer">' +
         esc(ref.id + " · " + ref.name) + "</a><br><span class=\"hint\">" + esc(ref.condition) + "</span></p>").join("") +
@@ -237,7 +323,7 @@ function drawChart() {
   if (!points.length) { $("#chartCaption").textContent = ""; return; }
   const max = Math.max(...points.map(p => p.count), 1);
   const width=1000, height=220, left=55, top=10, plotHeight=175, step=(width-left-10)/points.length;
-  const peakTimes = data.incidents.filter(i => !i.kind.startsWith("finestra")).map(i=>Date.parse(i.time));
+  const peakTimes = data.incidents.filter(i => i.flagged).map(i=>Date.parse(i.time));
   let svg = "";
   for (let tick=0;tick<=4;tick++) {
     const y=top+plotHeight*tick/4;
@@ -262,6 +348,12 @@ function download(text, name, type) {
 $("#choose").addEventListener("click",()=>$("#file").click());
 $("#file").addEventListener("change",event=>event.target.files[0] && loadFile(event.target.files[0]));
 $("#reanalyze").addEventListener("click",()=>lastFile && loadFile(lastFile));
+$("#useHistory").addEventListener("change",updateHistoryControls);
+$("#diagnosticFilter").addEventListener("change",renderDiagnosticIssues);
+$("#downloadImport").addEventListener("click",()=>{
+  if(importReport) download(JSON.stringify({source:importSource,quality:importReport},null,2),
+    "diagnosi-import.json","application/json;charset=utf-8");
+});
 for(const name of ["dragenter","dragover"]) $("#drop").addEventListener(name,event=>{event.preventDefault();$("#drop").classList.add("drag");});
 for(const name of ["dragleave","drop"]) $("#drop").addEventListener(name,event=>{event.preventDefault();$("#drop").classList.remove("drag");});
 $("#drop").addEventListener("drop",event=>event.dataTransfer.files[0] && loadFile(event.dataTransfer.files[0]));
@@ -285,3 +377,4 @@ $("#downloadEvidence").addEventListener("click",()=>{
     selected_cause:choices.get(active.id),...active,ticket:$("#ticket").value},null,2),
     "dossier-"+active.id+".json","application/json;charset=utf-8");
 });
+updateHistoryControls();

@@ -163,6 +163,14 @@ def auth_sequences(events):
 
 
 def markdown_ticket(incident, filename, file_hash, quality):
+    history_lines = [
+        "- Storico macchina: incluso (finestre precedenti dello stesso host nel file importato).",
+        f"- Baseline: {incident['baseline']:.2f} eventi/finestra su {incident['baseline_windows']} finestre precedenti.",
+        f"- Soglia finale host: {incident['cutoff']} eventi; mediana precedente {incident['median']}, MAD {incident['mad']}."
+    ] if incident["use_history"] else [
+        "- Storico macchina: escluso. Nessun confronto con finestre precedenti.",
+        f"- Soglia assoluta: almeno {incident['cutoff']} eventi nella finestra. Non dimostra uno spike relativo al passato."
+    ]
     lines = [f"# Analisi eventi syslog — {incident['host']} — {incident['time']}",
              "", "Stato: bozza da verificare",
              "Causa selezionata: da determinare", "",
@@ -171,8 +179,7 @@ def markdown_ticket(incident, filename, file_hash, quality):
              f"- Host: {incident['host']}; HostIP: {', '.join(incident['host_ips']) or 'non disponibile'}",
              f"- Finestra UTC: [{incident['time']}, {incident['end']})",
              f"- {incident['count']} eventi; classificazione: {incident['kind']}.",
-             f"- Baseline: {incident['baseline']:.2f} eventi/finestra su {incident['baseline_windows']} finestre precedenti.",
-             f"- Soglia finale host: {incident['cutoff']} eventi; mediana precedente {incident['median']}, MAD {incident['mad']}.",
+             *history_lines,
              f"- Processi: {', '.join(p['name'] + ' (' + str(p['count']) + ')' for p in incident['processes'])}.",
              "- Le percentuali seguenti hanno come denominatore tutti gli eventi di questo host nella finestra.",
              "", "## Tipi di eventi"]
@@ -212,9 +219,12 @@ def markdown_ticket(incident, filename, file_hash, quality):
               "- I conteggi misurano eventi di log, non byte/pacchetti, banda o probabilità di compromissione.",
               "- HostIP identifica l'host del record; SRC/DST vengono estratti solo quando espliciti nel messaggio.",
               "- Confermare il picco con contatori di interfaccia, firewall, proxy o NetFlow e verificare la direzione.",
-              "- Le finestre senza eventi sono trattate come zero: verificare continuità della raccolta e cambi del livello di logging.",
+              ("- Le finestre senza eventi sono trattate come zero: verificare continuità della raccolta e cambi del livello di logging."
+               if incident["use_history"] else "- Confronto storico disattivato: quote e ipotesi riguardano solo la finestra selezionata."),
               f"- Timestamp senza fuso interpretati come {quality['naive_offset']}; date con slash: {quality['date_order']}.",
               f"- Qualità input: {json.dumps(quality['counts'], ensure_ascii=False)}; limite eventi raggiunto: {quality['truncated']}.",
+              f"- Import: {quality['summary']['analyzed_records']} record analizzati su {quality['summary']['records_read']} esaminati; "
+              f"{quality['summary']['skipped_records']} esclusi per struttura CSV non valida.",
               f"- Evidenze mostrate {len(incident['evidence'])}/{incident['count']}; i testi oltre 2000 caratteri sono troncati.",
               f"- Catalogo locale {CATALOG['version']}; MITRE consultato il {CATALOG['mitre_reviewed']}.",
               "", "## Impatto e note dell'analista", "Da completare: impatto misurato, verifiche effettuate, esito e responsabile."]
